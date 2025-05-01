@@ -9,7 +9,7 @@ public class UrlCreateDto
     public string? Url { get; set; }
 
     // Can use this code if accept the url from request body to handle the binding
-    // public static async ValueTask<UrlCreateDto?> BindAsync(HttpContext context, ParameterInfo parameterInfo)
+    // public static async ValueTask<UrlCreateDto?> BindAsync(HttpContext context)
     // {
     //     if (context.Request.ContentLength == 0)
     //     {

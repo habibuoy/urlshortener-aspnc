@@ -1,5 +1,5 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using UrlShortener.Data;
 using UrlShortener.Model;
@@ -53,6 +53,33 @@ app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, Applicatio
     return Results.Ok(result.ToDto());
 });
 
+app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto url, ApplicationDbContext dbContext) =>
+{
+    if (url == null
+        || string.IsNullOrEmpty(url.Url)
+        || !Uri.TryCreate(url.Url, UriKind.Absolute, out var uri))
+    {
+        return Results.BadRequest("Please provide a valid URL that you want to shorten.");
+    }
+
+    if (string.IsNullOrEmpty(url.CustomPath)
+        || !UrlShortenerUtils.ValidateCustomPath(url.CustomPath))
+    {
+        return Results.BadRequest("Please provide a valid custom path for you shortened URL. Maximum 20 characters and only alpabhet and numbers");
+    }
+
+    if (await dbContext.Urls.FirstOrDefaultAsync(u => u.Shortened == url.CustomPath) is not null)
+    {
+        return Results.Conflict($"Custom path: {url.CustomPath} already exists, please choose another");
+    }
+
+    var result = url.ToUrlEnt(DateTime.Now, url.CustomPath);
+    dbContext.Urls.Add(result);
+    await dbContext.SaveChangesAsync();
+
+    return Results.Ok(result.ToDto());
+});
+
 app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext) =>
 {
     if (id == null
@@ -91,10 +118,15 @@ app.MapGet("/s/{url}", static async (string? url, ApplicationDbContext dbContext
 
 app.Run();
 
-public static class UrlShortenerUtils
+public static partial class UrlShortenerUtils
 {
     private const string Characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890";
     private const int MaximumLength = 6;
+    private const int MaximumCustomPathLength = 20;
+    private const string CustomPathRegexPattern = "^[a-zA-Z0-9]*$";
+
+    [GeneratedRegex(CustomPathRegexPattern)]
+    private static partial Regex CustomPathRegex();
 
     public static string Generate(int maximumLength = MaximumLength)
     {
@@ -110,5 +142,11 @@ public static class UrlShortenerUtils
             numbers += Characters[index];
         }
         return numbers;
+    }
+
+    public static bool ValidateCustomPath(string customPath)
+    {
+        if (customPath.Length > MaximumCustomPathLength) return false;
+        return CustomPathRegex().IsMatch(customPath);
     }
 }
