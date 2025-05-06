@@ -11,8 +11,8 @@ This project uses SQL Server as its database and assumes you have a running SQL 
 You can run the `dotnet ef database update after you clone this repository to run the necessary migrations.
 
 ### Endpoints
-| endpoint            | query param                       | request body                         | authorization header | response body                                 | Example                                                                           |
-|---------------------|-----------------------------------|--------------------------------------|----------------------|-----------------------------------------------|-----------------------------------------------------------------------------------|
+|       endpoint      |            query param            |             request body             | authorization header |                 response body                 |                                      Example                                      |
+|:-------------------:|:---------------------------------:|:------------------------------------:|:--------------------:|:---------------------------------------------:|:---------------------------------------------------------------------------------:|
 | POST /register      |                 -                 | [RegisterRequest](#register-request) |           -          |                       -                       | https://localhost:7000/register                                                   |
 | POST /login         |                 -                 |    [LoginRequest](#login-request)    |           -          | [AccessTokenResponse](#access-token-response) | https://localhost:7000/login                                                      |
 | POST /logout        |                 -                 |                   -                  |    Bearer {token}    |                       -                       | https://localhost:7000/logout                                                     |
@@ -29,6 +29,16 @@ You can run the `dotnet ef database update after you clone this repository to ru
 - The `GET /id/{id}` endpoint requires a bearer token if the checked URL is created by an authenticated user (mostly from the /create/custom endpoint). If the URL was generated randomly, this endpoint won't need a bearer token.
 
 ### JSON Objects
+All the JSON Objects below are nested within a response JSON.  
+```
+{
+  "message": "Meaningful message",
+  "result": null,
+}
+```
+
+If the response is successful then the message will most likely be empty with the JSON Object as the result. While a non-success response will have a meaningful message about the cause and the result will be null
+
 #### Register Request
 ```
   {
@@ -52,16 +62,12 @@ Password: string (Required), contains uppercase, lowercase, numbers, and non-let
 #### Access Token Response
 ```
   {
-    "tokenType": "bearer",
     "accessToken": "token",
-    "expiresIn": 60,
-    "refreshToken": "Ignore This"
+    "expiredAt": "2025-05-02T12:55:06.961584",
   }
 ```
-Token Type: string  
 Access Token: string, a set of characters that represents your identity. Use this in the authorization header for the endpoint that needs it.  
-Expires In: int, time in seconds of when the token will expire. (60s)  
-Refresh Token: string, just ignore this.
+Expires In: string, formatted in date-time of when the token will expire.
 
 #### URL Response
 ```
