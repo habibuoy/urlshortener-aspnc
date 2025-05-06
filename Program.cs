@@ -7,6 +7,7 @@ using UrlShortener.Data;
 using UrlShortener.Model;
 using Microsoft.AspNetCore.Authorization;
 using System.Text.Json.Nodes;
+using UrlShortener.BackgroundServices;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -25,6 +26,8 @@ builder.Services.AddAuthorization();
 builder.Services.AddIdentityCore<IdentityUser>()
     .AddEntityFrameworkStores<ApplicationDbContext>()
     .AddApiEndpoints();
+
+builder.Services.AddHostedService<ExpiredUrlRemoverHostedService>();
 
 UrlEntExtensions.Init("https://localhost:7000", "/s/");
 
