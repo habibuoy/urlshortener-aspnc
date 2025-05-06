@@ -11,4 +11,12 @@ public class ApplicationDbContext : IdentityDbContext<IdentityUser>
         : base(options) { }
 
     public DbSet<UrlEnt> Urls { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.Entity<UrlEnt>()
+            .HasOne(url => url.User).WithMany().HasForeignKey(u => u.CreatorUserId);
+    }
 }

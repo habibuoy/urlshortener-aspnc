@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Identity;
+
 namespace UrlShortener.Model;
 
 public class UrlEnt
@@ -7,6 +9,9 @@ public class UrlEnt
     public required string Original { get; set; }
     public required string Shortened { get; set; }
     public DateTime? ExpiredAt { get; set; }
+
+    public string? CreatorUserId { get; set; }
+    public IdentityUser? User { get; set; }
 
     public void GiveExpirationTime(int seconds)
     {
