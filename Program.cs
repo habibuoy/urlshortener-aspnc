@@ -12,6 +12,8 @@ using System.Security.Claims;
 using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication.BearerToken;
 using UrlShortener.Responses;
+using System.Text.Json;
+using Microsoft.AspNetCore.Identity.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -45,15 +47,26 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
 // put this middleware before the authentication and authorization middleware
 // for writing the response body with 401 response code
 // also for capturing the token generated after the authentication process
 app.Use(async (context, next) =>
 {
+    if (PathHelper.IsHiddenPath(context))
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+
     var endpoint = context.GetEndpoint();
 
     bool isLoginPath = context.Request.Path == "/login";
+    bool isRegisterPath = context.Request.Path == "/register";
+
+    if (isRegisterPath)
+    {
+        context.Request.EnableBuffering();
+    }
 
     // cache the original body stream as it was a forward-only body and can only be read
     // once the response is written
@@ -92,44 +105,79 @@ app.Use(async (context, next) =>
     // proceed with the rest of the pipeline
     await next();
 
-    // if the request is to login path
-    // we store the the generated token into our own token manager so that
-    // we can manually expire it instead of waiting for the expiration time
-    if (isLoginPath
-        && context.Response.StatusCode == StatusCodes.Status200OK)
+    if (context.Response.StatusCode == StatusCodes.Status200OK)
     {
-        // move the stream position to the beginning
-        // and read the stream and return as json string
-        memoryStream!.Seek(0, SeekOrigin.Begin);
-        var responseBody = await new StreamReader(memoryStream).ReadToEndAsync();
-
-        try
+        // if the request is to login path
+        // we store the the generated token into our own token manager so that
+        // we can manually expire it instead of waiting for the expiration time
+        if (isLoginPath)
         {
-            var jsonNode = JsonNode.Parse(responseBody);
-            if (jsonNode != null
-                && jsonNode["accessToken"] is JsonNode accToken)
-            {
-                // get the token value in the json body using
-                // accessToken key from ASP.NET Core AccessTokenResponse object
-                var accessToken = accToken.GetValue<string>();
-                var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
+            // move the stream position to the beginning
+            // and read the stream and return as json string
+            memoryStream!.Seek(0, SeekOrigin.Begin);
+            var streamReader = new StreamReader(memoryStream);
+            var responseBody = await streamReader.ReadToEndAsync();
 
-                // then store it into our token manager
-                var success = tokenManager.Add(accessToken);
+            try
+            {
+                var jsonNode = JsonNode.Parse(responseBody);
+                if (jsonNode != null
+                    && jsonNode["accessToken"] is JsonNode accToken)
+                {
+                    // get the token value in the json body using
+                    // accessToken key from ASP.NET Core AccessTokenResponse object
+                    var accessToken = accToken.GetValue<string>();
+                    var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
+
+                    // then store it into our token manager
+                    var success = tokenManager.Add(accessToken);
+                    var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>();
+                    var tokenProtector = tokenOptions.Get(IdentityConstants.BearerScheme).BearerTokenProtector;
+
+                    var tokenData = tokenProtector.Unprotect(accessToken);
+                    var expireDt = tokenData!.Properties.ExpiresUtc!.Value.LocalDateTime;
+
+                    var accessTokenDto = new AccessTokenDto()
+                    {
+                        AccessToken = accessToken,
+                        ExpiredAt = expireDt
+                    };
+
+                    memoryStream.SetLength(0);
+                    await memoryStream.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(accessTokenDto));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error while deserializing the access token: {ex}");
+            }
+
+            // move the stream position bac to the beginning
+            // and copy its value to the original response body stream
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            await memoryStream.CopyToAsync(originalBodyStream);
+            streamReader.Dispose();
+
+            // then reassign the original response body stream;
+            context.Response.Body = originalBodyStream;
+        }
+        else if (isRegisterPath)
+        {
+            try
+            {
+                context.Request.Body.Position = 0;
+                var requestBody = await context.Request.ReadFromJsonAsync<RegisterRequest>();
+
+                if (requestBody != null)
+                {
+                    await context.Response.WriteAsJsonAsync(ResponseObject.Create($"User {requestBody.Email} has been created succesfully"));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error while parsing register request body: {ex}");
             }
         }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Error while deserializing the access token: {ex}");
-        }
-
-        // move the stream position bac to the beginning
-        // and copy its value to the original response body stream
-        memoryStream.Seek(0, SeekOrigin.Begin);
-        await memoryStream.CopyToAsync(originalBodyStream);
-
-        // then reassign the original response body stream;
-        context.Response.Body = originalBodyStream;
     }
 
     // don't forget to release the resource
@@ -430,5 +478,30 @@ public static class ValidityStatusExtensions
         }
 
         return ResponseObject.Create(message, result);
+    }
+}
+
+public static class PathHelper
+{
+    private static readonly string[] HiddenPaths =
+    {
+        "/refresh",
+        "/confirmEmail",
+        "/resendConfirmationEmail",
+        "/forgotPassword",
+        "/resetPassword",
+        "/manage/2fa",
+        "/manage/info"
+    };
+
+    public static bool IsHiddenPath(HttpContext httpContext)
+    {
+        var path = httpContext.Request.Path.Value;
+        if (HiddenPaths.Contains(path))
+        {
+            return true;
+        }
+
+        return false;
     }
 }
