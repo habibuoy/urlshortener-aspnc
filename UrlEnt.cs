@@ -6,10 +6,18 @@ public class UrlEnt
     public required DateTime CreatedAt { get; set; }
     public required string Original { get; set; }
     public required string Shortened { get; set; }
+    public DateTime? ExpiredAt { get; set; }
+
+    public void GiveExpirationTime(int seconds)
+    {
+        ExpiredAt = CreatedAt.AddSeconds(seconds);
+    }
 }
 
 public static class UrlEntExtensions
 {
+    public const int NonUserUrlExpirationDuration = 20; // in s
+
     private static string domain = string.Empty;
     private static string path = string.Empty;
 
@@ -25,6 +33,7 @@ public static class UrlEntExtensions
         {
             Id = url.Id,
             CreatedAt = url.CreatedAt,
+            ExpiredAt = url.ExpiredAt,
             OriginalUrl = url.Original,
             ShortenedUrl = domain + path + url.Shortened
         };
@@ -36,6 +45,7 @@ public static class UrlEntExtensions
         {
             Id = url.Id,
             CreatedAt = url.CreatedAt,
+            ExpiredAt = url.ExpiredAt,
             OriginalUrl = url.Original,
             ShortenedUrl = domain + path + url.Shortened
         };

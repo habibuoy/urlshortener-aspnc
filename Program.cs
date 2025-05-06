@@ -161,6 +161,7 @@ app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, Applicatio
     }
 
     var result = url.ToUrlEnt(DateTime.Now, shortened);
+    result.GiveExpirationTime(UrlEntExtensions.NonUserUrlExpirationDuration);
     dbContext.Urls.Add(result);
     await dbContext.SaveChangesAsync();
 
@@ -227,6 +228,12 @@ app.MapGet("/s/{url}", static async (string? url, ApplicationDbContext dbContext
         || await dbContext.Urls.FirstOrDefaultAsync(u => u.Shortened == url) is not UrlEnt result)
     {
         return Results.NotFound("Please provide valid shortened url.");
+    }
+
+    if (result.ExpiredAt != null
+        && DateTime.Now > result.ExpiredAt)
+    {
+        return Results.Ok("This url has expired and cannot be used again.");
     }
 
     return Results.Redirect(result.Original!, true);

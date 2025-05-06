@@ -6,4 +6,5 @@ public class UrlDto
     public DateTime? CreatedAt { get; set; }
     public string? OriginalUrl { get; set; }
     public string? ShortenedUrl { get; set; }
+    public DateTime? ExpiredAt { get; set; }
 }
