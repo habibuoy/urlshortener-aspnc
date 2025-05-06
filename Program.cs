@@ -11,6 +11,7 @@ using UrlShortener.BackgroundServices;
 using System.Security.Claims;
 using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication.BearerToken;
+using UrlShortener.Responses;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -78,10 +79,11 @@ app.Use(async (context, next) =>
         {
             var token = authorization.Replace("Bearer", "").Trim();
             var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-            if (!tokenManager.IsValid(token))
+            var validity = tokenManager.CheckValidity(token);
+            if (validity != BearerTokenManager.ValidityStatus.Valid)
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await context.Response.WriteAsJsonAsync("Your token is expired");
+                await context.Response.WriteAsJsonAsync(validity.ToResponseObject());
                 return;
             }
         }
@@ -138,7 +140,7 @@ app.Use(async (context, next) =>
     if (context.Response.StatusCode == StatusCodes.Status401Unauthorized
             && !context.Response.HasStarted)
     {
-        await context.Response.WriteAsJsonAsync("Please provide valid token");
+        await context.Response.WriteAsJsonAsync(ResponseObject.TokenNotValid());
     }
 });
 
@@ -148,7 +150,11 @@ app.UseAuthorization();
 app.MapGet("/all", static async (ApplicationDbContext dbContext, HttpContext httpContext) =>
 {
     var userId = httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier);
-    return await dbContext.Urls.Where(u => u.CreatorUserId == userId).Select(url => url.ToDto()).ToListAsync();
+    var result = await dbContext.Urls
+        .Where(u => u.CreatorUserId == userId)
+        .Select(url => url.ToDto()).ToListAsync();
+
+    return Results.Ok(ResponseObject.Create(result));
 })
 .RequireAuthorization();
 
@@ -158,7 +164,7 @@ app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, Applicatio
         || string.IsNullOrEmpty(url.Url)
         || !Uri.TryCreate(url.Url, UriKind.Absolute, out var uri))
     {
-        return Results.BadRequest("Please provide a valid URL that you want to shorten.");
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid URL that you want to shorten."));
     }
 
     string shortened = "";
@@ -173,7 +179,7 @@ app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, Applicatio
     dbContext.Urls.Add(result);
     await dbContext.SaveChangesAsync();
 
-    return Results.Ok(result.ToDto());
+    return Results.Ok(ResponseObject.Create(result.ToDto()));
 });
 
 app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto url, HttpContext context, ApplicationDbContext dbContext) =>
@@ -182,18 +188,19 @@ app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto ur
         || string.IsNullOrEmpty(url.Url)
         || !Uri.TryCreate(url.Url, UriKind.Absolute, out var uri))
     {
-        return Results.BadRequest("Please provide a valid URL that you want to shorten.");
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid URL that you want to shorten."));
     }
 
     if (string.IsNullOrEmpty(url.CustomPath)
         || !UrlShortenerUtils.ValidateCustomPath(url.CustomPath))
     {
-        return Results.BadRequest("Please provide a valid custom path for you shortened URL. Maximum 20 characters and only alphabet and numbers");
+        return Results.BadRequest(ResponseObject.Create(
+            "Please provide a valid custom path for you shortened URL. Maximum 20 characters and only alphabet and numbers"));
     }
 
     if (await dbContext.Urls.FirstOrDefaultAsync(u => u.Shortened == url.CustomPath) is not null)
     {
-        return Results.Conflict($"Custom path: {url.CustomPath} already exists, please choose another");
+        return Results.Conflict(ResponseObject.Create($"Custom path: {url.CustomPath} already exists, please choose another"));
     }
 
     var userId = context.User.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -202,7 +209,7 @@ app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto ur
     dbContext.Urls.Add(result);
     await dbContext.SaveChangesAsync();
 
-    return Results.Ok(result.ToDto());
+    return Results.Ok(ResponseObject.Create(result.ToDto()));
 })
 .RequireAuthorization();
 
@@ -210,16 +217,16 @@ app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext
 {
     if (id == null)
     {
-        return Results.NotFound("Please provide valid id.");
+        return Results.NotFound(ResponseObject.Create("Please provide valid id.", null));
+    }
+
+    if (await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
+    {
+        return Results.NotFound(ResponseObject.Create("Url not found. Please provide valid id.", null));
     }
 
     string authorizationHeader = context.Request.Headers.Authorization.ToString();
     bool hasBearerToken = authorizationHeader.Contains("Bearer");
-
-    if (await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
-    {
-        return Results.NotFound("Url not found. Please provide valid id.");
-    }
 
     bool isAuthorized = true;
 
@@ -234,9 +241,11 @@ app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext
             var token = authorizationHeader.Replace("Bearer", "").Trim();
             var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
 
-            if (!tokenManager.IsValid(token))
+            var validity = tokenManager.CheckValidity(token);
+            if (validity != BearerTokenManager.ValidityStatus.Valid)
             {
-                return Results.Json("Your token is expired", statusCode: StatusCodes.Status401Unauthorized);
+                return Results.Json(validity.ToResponseObject(),
+                    statusCode: StatusCodes.Status401Unauthorized);
             }
 
             var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>();
@@ -251,10 +260,11 @@ app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext
 
     if (!isAuthorized)
     {
-        return Results.Json("You are not authorized to view this URL", statusCode: StatusCodes.Status401Unauthorized);
+        return Results.Json(ResponseObject.NotAuthorized(),
+            statusCode: StatusCodes.Status401Unauthorized);
     }
 
-    return Results.Ok(existing.ToDto());
+    return Results.Ok(ResponseObject.Create(existing.ToDto()));
 });
 
 app.MapDelete("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext, ClaimsPrincipal user) =>
@@ -262,19 +272,19 @@ app.MapDelete("/id/{id:int}", static async (int? id, ApplicationDbContext dbCont
     if (id == null
         || await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
     {
-        return Results.NotFound("Url not found. Please provide valid id.");
+        return Results.NotFound(ResponseObject.Create("Url not found. Please provide valid id."));
     }
 
     if (existing.CreatorUserId == null
         || existing.CreatorUserId != user.FindFirstValue(ClaimTypes.NameIdentifier))
     {
-        return Results.Json("You are not authorized to delete this URL", statusCode: StatusCodes.Status401Unauthorized);
+        return Results.Json(ResponseObject.NotAuthorized(), statusCode: StatusCodes.Status401Unauthorized);
     }
 
     dbContext.Remove(existing);
     await dbContext.SaveChangesAsync();
 
-    return Results.Ok($"Url with id {id} was deleted successfully.");
+    return Results.Ok(ResponseObject.Create($"Url with id {id} was deleted successfully."));
 })
 .RequireAuthorization();
 
@@ -283,13 +293,14 @@ app.MapGet("/s/{url}", static async (string? url, ApplicationDbContext dbContext
     if (string.IsNullOrEmpty(url)
         || await dbContext.Urls.FirstOrDefaultAsync(u => u.Shortened == url) is not UrlEnt result)
     {
-        return Results.NotFound("Please provide valid shortened url.");
+        return Results.NotFound(ResponseObject.Create("Please provide valid shortened url."));
     }
 
     if (result.ExpiredAt != null
         && DateTime.Now > result.ExpiredAt)
     {
-        return Results.Ok("This url has expired and cannot be used again.");
+        return Results.Json(ResponseObject.Create("This url has expired and cannot be used again."),
+            statusCode: StatusCodes.Status204NoContent);
     }
 
     return Results.Redirect(result.Original!, true);
@@ -302,7 +313,12 @@ app.MapPost("/logout", static async (HttpContext context) =>
 
     var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
     tokenManager.Expire(token);
-}).RequireAuthorization();
+
+    await Task.CompletedTask;
+
+    return Results.Ok(ResponseObject.Create("Logged out succesfully. Token has been expired"));
+})
+.RequireAuthorization();
 
 app.Run();
 
@@ -369,14 +385,14 @@ public class BearerTokenManager
         return false;
     }
 
-    public bool IsValid(string token)
+    public ValidityStatus CheckValidity(string token)
     {
         if (bearerTokens.FirstOrDefault(t => t.Token == token) is BearerToken bearerToken)
         {
-            return !bearerToken.IsExpired;
+            return bearerToken.IsExpired ? ValidityStatus.Expired : ValidityStatus.Valid;
         }
 
-        return false;
+        return ValidityStatus.NotValid;
     }
 
     public class BearerToken
@@ -388,5 +404,31 @@ public class BearerTokenManager
         {
             return Token;
         }
+    }
+
+    public enum ValidityStatus
+    {
+        NotValid,
+        Valid,
+        Expired
+    }
+}
+
+public static class ValidityStatusExtensions
+{
+    public static ResponseObject ToResponseObject(this BearerTokenManager.ValidityStatus validity, object? result = null)
+    {
+        string message = "";
+
+        switch (validity)
+        {
+            case BearerTokenManager.ValidityStatus.Expired:
+                return ResponseObject.TokenExpired(result);
+            case BearerTokenManager.ValidityStatus.NotValid:
+                message = "Your token is not valid";
+                break;
+        }
+
+        return ResponseObject.Create(message, result);
     }
 }
