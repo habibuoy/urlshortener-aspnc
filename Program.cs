@@ -8,6 +8,9 @@ using UrlShortener.Model;
 using Microsoft.AspNetCore.Authorization;
 using System.Text.Json.Nodes;
 using UrlShortener.BackgroundServices;
+using System.Security.Claims;
+using Microsoft.Extensions.Options;
+using Microsoft.AspNetCore.Authentication.BearerToken;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -54,7 +57,7 @@ app.Use(async (context, next) =>
     // cache the original body stream as it was a forward-only body and can only be read
     // once the response is written
     var originalBodyStream = context.Response.Body;
-    MemoryStream memoryStream = null;
+    MemoryStream memoryStream = null!;
     
     // replace the original response body stream with a MemoryStream
     if (isLoginPath)
@@ -142,10 +145,12 @@ app.Use(async (context, next) =>
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapGet("/all", static async (ApplicationDbContext dbContext) =>
+app.MapGet("/all", static async (ApplicationDbContext dbContext, HttpContext httpContext) =>
 {
-    return await dbContext.Urls.Select(url => url.ToDto()).ToListAsync();
-});
+    var userId = httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier);
+    return await dbContext.Urls.Where(u => u.CreatorUserId == userId).Select(url => url.ToDto()).ToListAsync();
+})
+.RequireAuthorization();
 
 app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, ApplicationDbContext dbContext) =>
 {
@@ -173,7 +178,6 @@ app.MapPost("/create", static async ([AsParameters] UrlCreateDto url, Applicatio
 
 app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto url, HttpContext context, ApplicationDbContext dbContext) =>
 {
-    Debug.WriteLine($"Authorization: {context.Request.Headers.Authorization}");
     if (url == null
         || string.IsNullOrEmpty(url.Url)
         || !Uri.TryCreate(url.Url, UriKind.Absolute, out var uri))
@@ -184,7 +188,7 @@ app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto ur
     if (string.IsNullOrEmpty(url.CustomPath)
         || !UrlShortenerUtils.ValidateCustomPath(url.CustomPath))
     {
-        return Results.BadRequest("Please provide a valid custom path for you shortened URL. Maximum 20 characters and only alpabhet and numbers");
+        return Results.BadRequest("Please provide a valid custom path for you shortened URL. Maximum 20 characters and only alphabet and numbers");
     }
 
     if (await dbContext.Urls.FirstOrDefaultAsync(u => u.Shortened == url.CustomPath) is not null)
@@ -192,7 +196,9 @@ app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto ur
         return Results.Conflict($"Custom path: {url.CustomPath} already exists, please choose another");
     }
 
+    var userId = context.User.FindFirstValue(ClaimTypes.NameIdentifier);
     var result = url.ToUrlEnt(DateTime.Now, url.CustomPath);
+    result.CreatorUserId = userId;
     dbContext.Urls.Add(result);
     await dbContext.SaveChangesAsync();
 
@@ -200,7 +206,58 @@ app.MapPost("/create/custom", static async ([AsParameters] UrlCustomCreateDto ur
 })
 .RequireAuthorization();
 
-app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext) =>
+app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext, HttpContext context) =>
+{
+    if (id == null)
+    {
+        return Results.NotFound("Please provide valid id.");
+    }
+
+    string authorizationHeader = context.Request.Headers.Authorization.ToString();
+    bool hasBearerToken = authorizationHeader.Contains("Bearer");
+
+    if (await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
+    {
+        return Results.NotFound("Url not found. Please provide valid id.");
+    }
+
+    bool isAuthorized = true;
+
+    if (existing.CreatorUserId != null)
+    {
+        if (!hasBearerToken)
+        {
+            isAuthorized = false;
+        }
+        else
+        {
+            var token = authorizationHeader.Replace("Bearer", "").Trim();
+            var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
+
+            if (!tokenManager.IsValid(token))
+            {
+                return Results.Json("Your token is expired", statusCode: StatusCodes.Status401Unauthorized);
+            }
+
+            var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>();
+            var tokenProtector = tokenOptions.Get(IdentityConstants.BearerScheme).BearerTokenProtector;
+
+            var tokenData = tokenProtector.Unprotect(token);
+            var userId = tokenData!.Principal.FindFirstValue(ClaimTypes.NameIdentifier);
+
+            isAuthorized = userId == existing.CreatorUserId;
+        }
+    }
+
+    if (!isAuthorized)
+    {
+        return Results.Json("You are not authorized to view this URL", statusCode: StatusCodes.Status401Unauthorized);
+    }
+
+    return Results.Ok(existing.ToDto());
+});
+
+app.MapDelete("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext, ClaimsPrincipal user) =>
 {
     if (id == null
         || await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
@@ -208,22 +265,18 @@ app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext
         return Results.NotFound("Url not found. Please provide valid id.");
     }
 
-    return Results.Ok(existing.ToDto());
-});
-
-app.MapDelete("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext) =>
-{
-    if (id == null
-        || await dbContext.Urls.FindAsync(id) is not UrlEnt existing)
+    if (existing.CreatorUserId == null
+        || existing.CreatorUserId != user.FindFirstValue(ClaimTypes.NameIdentifier))
     {
-        return Results.NotFound("Url not found. Please provide valid id.");
+        return Results.Json("You are not authorized to delete this URL", statusCode: StatusCodes.Status401Unauthorized);
     }
 
     dbContext.Remove(existing);
     await dbContext.SaveChangesAsync();
 
     return Results.Ok($"Url with id {id} was deleted successfully.");
-});
+})
+.RequireAuthorization();
 
 app.MapGet("/s/{url}", static async (string? url, ApplicationDbContext dbContext) =>
 {
@@ -288,7 +341,7 @@ public static partial class UrlShortenerUtils
 
 public class BearerTokenManager
 {
-    public readonly List<BearerToken> bearerTokens = new();
+    private readonly List<BearerToken> bearerTokens = new();
 
     public bool Add(string token)
     {
