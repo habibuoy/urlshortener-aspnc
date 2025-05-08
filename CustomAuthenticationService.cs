@@ -3,8 +3,8 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.BearerToken;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
+using UrlShortener.Interfaces;
 using UrlShortener.Model;
-using UrlShortener.Responses;
 
 namespace UrlShortener.Handlers;
 
@@ -21,7 +21,8 @@ public class CustomAuthenticationService : IAuthenticationService
     {
         if (scheme == IdentityConstants.BearerScheme)
         {
-            var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>().Get(IdentityConstants.BearerScheme);
+            var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>()
+                .Get(IdentityConstants.BearerScheme);
 
             var expirationTime = DateTime.UtcNow.Add(tokenOptions.BearerTokenExpiration);
             properties ??= new();
@@ -38,6 +39,9 @@ public class CustomAuthenticationService : IAuthenticationService
                 AccessToken = token,
                 ExpiredAt = expirationTime.ToLocalTime()
             };
+
+            var tokenStore = context.RequestServices.GetRequiredService<ITokenStorer>();
+            await tokenStore.RecordAsync(token);
 
             await context.Response.WriteAsJsonAsync(tokenDto);
         }
