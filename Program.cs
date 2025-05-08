@@ -1,19 +1,17 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Identity;
 using UrlShortener.Data;
 using UrlShortener.Model;
-using Microsoft.AspNetCore.Authorization;
-using System.Text.Json.Nodes;
 using UrlShortener.BackgroundServices;
 using System.Security.Claims;
 using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication.BearerToken;
 using UrlShortener.Responses;
-using System.Text.Json;
 using Microsoft.AspNetCore.Identity.Data;
+using Microsoft.AspNetCore.Mvc;
+using System.ComponentModel.DataAnnotations;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -30,15 +28,13 @@ builder.Services.AddAuthentication()
 builder.Services.AddAuthorization();
 
 builder.Services.AddIdentityCore<IdentityUser>()
-    .AddEntityFrameworkStores<ApplicationDbContext>()
-    .AddApiEndpoints();
+    .AddEntityFrameworkStores<ApplicationDbContext>();
 
 builder.Services.AddHostedService<ExpiredUrlRemoverHostedService>();
 
 UrlEntExtensions.Init("https://localhost:7000", "/s/");
 
 var app = builder.Build();
-app.MapIdentityApi<IdentityUser>();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -47,153 +43,95 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
 // put this middleware before the authentication and authorization middleware
 // for writing the response body with 401 response code
-// also for capturing the token generated after the authentication process
 app.Use(async (context, next) =>
 {
-    if (PathHelper.IsHiddenPath(context))
+    try
     {
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return;
-    }
+        await next(context);
 
-    var endpoint = context.GetEndpoint();
-
-    bool isLoginPath = context.Request.Path == "/login";
-    bool isRegisterPath = context.Request.Path == "/register";
-
-    if (isRegisterPath)
-    {
-        context.Request.EnableBuffering();
-    }
-
-    // cache the original body stream as it was a forward-only body and can only be read
-    // once the response is written
-    var originalBodyStream = context.Response.Body;
-    MemoryStream memoryStream = null!;
-    
-    // replace the original response body stream with a MemoryStream
-    if (isLoginPath)
-    {
-        memoryStream = new MemoryStream();
-        context.Response.Body = memoryStream;
-    }
-
-    // check if the token has been manually expired by hitting /logout endpoint
-    // then do not proceed the request pipeline
-    // and return 401 response code
-    if (endpoint != null
-        && endpoint.Metadata.Any(m => m.GetType() == typeof(AuthorizeAttribute)
-        && !isLoginPath))
-    {
-        var authorization = context.Request.Headers.Authorization.ToString();
-        if (authorization.Contains("Bearer"))
+        // if the response code is 401 and the body is empty
+        // we write a custom body
+        if (context.Response.StatusCode == StatusCodes.Status401Unauthorized
+                && !context.Response.HasStarted)
         {
-            var token = authorization.Replace("Bearer", "").Trim();
-            var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-            var validity = tokenManager.CheckValidity(token);
-            if (validity != BearerTokenManager.ValidityStatus.Valid)
-            {
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await context.Response.WriteAsJsonAsync(validity.ToResponseObject());
-                return;
-            }
+            await context.Response.WriteAsJsonAsync(ResponseObject.TokenNotValid());
         }
     }
-
-    // proceed with the rest of the pipeline
-    await next();
-
-    if (context.Response.StatusCode == StatusCodes.Status200OK)
+    catch (Exception ex)
     {
-        // if the request is to login path
-        // we store the the generated token into our own token manager so that
-        // we can manually expire it instead of waiting for the expiration time
-        if (isLoginPath)
+        var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+
+        if (ex is BadHttpRequestException badHttpRequestException)
         {
-            // move the stream position to the beginning
-            // and read the stream and return as json string
-            memoryStream!.Seek(0, SeekOrigin.Begin);
-            var streamReader = new StreamReader(memoryStream);
-            var responseBody = await streamReader.ReadToEndAsync();
+            logger.LogError("There was an error ({exType}) parsing request data {reqId}: {ex}", badHttpRequestException.GetType(), context.TraceIdentifier, ex);
 
-            try
-            {
-                var jsonNode = JsonNode.Parse(responseBody);
-                if (jsonNode != null
-                    && jsonNode["accessToken"] is JsonNode accToken)
-                {
-                    // get the token value in the json body using
-                    // accessToken key from ASP.NET Core AccessTokenResponse object
-                    var accessToken = accToken.GetValue<string>();
-                    var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-
-                    // then store it into our token manager
-                    var success = tokenManager.Add(accessToken);
-                    var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>();
-                    var tokenProtector = tokenOptions.Get(IdentityConstants.BearerScheme).BearerTokenProtector;
-
-                    var tokenData = tokenProtector.Unprotect(accessToken);
-                    var expireDt = tokenData!.Properties.ExpiresUtc!.Value.LocalDateTime;
-
-                    var accessTokenDto = new AccessTokenDto()
-                    {
-                        AccessToken = accessToken,
-                        ExpiredAt = expireDt
-                    };
-
-                    memoryStream.SetLength(0);
-                    await memoryStream.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(accessTokenDto));
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error while deserializing the access token: {ex}");
-            }
-
-            // move the stream position bac to the beginning
-            // and copy its value to the original response body stream
-            memoryStream.Seek(0, SeekOrigin.Begin);
-            await memoryStream.CopyToAsync(originalBodyStream);
-            streamReader.Dispose();
-
-            // then reassign the original response body stream;
-            context.Response.Body = originalBodyStream;
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsJsonAsync(ResponseObject.Create("Please provide a valid request data"));
         }
-        else if (isRegisterPath)
+        else
         {
-            try
-            {
-                context.Request.Body.Position = 0;
-                var requestBody = await context.Request.ReadFromJsonAsync<RegisterRequest>();
+            logger.LogError("There was an processing request {reqId}: {ex}", context.TraceIdentifier, ex);
 
-                if (requestBody != null)
-                {
-                    await context.Response.WriteAsJsonAsync(ResponseObject.Create($"User {requestBody.Email} has been created succesfully"));
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error while parsing register request body: {ex}");
-            }
+            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            await context.Response.WriteAsJsonAsync(ResponseObject.Create("There was an error processing your request on our server"));
         }
-    }
-
-    // don't forget to release the resource
-    memoryStream?.Dispose();
-
-    // if the response code is 401 and the body is empty
-    // we write a custom body
-    if (context.Response.StatusCode == StatusCodes.Status401Unauthorized
-            && !context.Response.HasStarted)
-    {
-        await context.Response.WriteAsJsonAsync(ResponseObject.TokenNotValid());
     }
 });
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapPost("/register", static async ([FromBody] RegisterRequest? registerRequest,
+    [FromServices] IServiceProvider sp) =>
+{
+    if (registerRequest == null)
+    {
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid request body"));
+    }
+
+    var userManager = sp.GetRequiredService<UserManager<IdentityUser>>();
+
+    if (!userManager.SupportsUserEmail)
+    {
+        throw new NotSupportedException($"/register endpoint needs user manager that supports email!");
+    }
+
+    var email = registerRequest.Email;
+    if (string.IsNullOrEmpty(email)
+        || !IdentityHelper.IsEmailValid(email))
+    {
+        return Results.BadRequest(ResponseObject.Create($"Please provide a valid email address"));
+    }
+
+    var user = new IdentityUser();
+    await userManager.SetUserNameAsync(user, email);
+    await userManager.SetEmailAsync(user, email);
+
+    var userResult = await userManager.CreateAsync(user, registerRequest.Password);
+
+    if (!userResult.Succeeded)
+    {
+        var errorPairs = userResult.Errors.Aggregate(new Dictionary<string, string[]>(),
+            (acc, next) =>
+        {
+            if (!acc.ContainsKey(next.Code))
+            {
+                acc[next.Code] = [next.Description];
+            }
+
+            return acc;
+        });
+
+        var problemDetails = new HttpValidationProblemDetails(errorPairs);
+
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid password", problemDetails));
+    }
+
+    return Results.Ok(ResponseObject.Create($"User {registerRequest.Email} has been registered succesfully"));
+});
 
 app.MapGet("/all", static async (ApplicationDbContext dbContext, HttpContext httpContext) =>
 {
@@ -400,6 +338,16 @@ public static partial class UrlShortenerUtils
     {
         if (customPath.Length > MaximumCustomPathLength) return false;
         return CustomPathRegex().IsMatch(customPath);
+    }
+}
+
+public static class IdentityHelper
+{
+    private static EmailAddressAttribute emailAddressAttribute = new();
+
+    public static bool IsEmailValid(string email)
+    {
+        return emailAddressAttribute.IsValid(email);
     }
 }
 
