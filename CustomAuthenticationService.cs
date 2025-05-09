@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using UrlShortener.Interfaces;
 using UrlShortener.Model;
+using UrlShortener.Responses;
 
 namespace UrlShortener.Handlers;
 
@@ -41,9 +42,10 @@ public class CustomAuthenticationService : IAuthenticationService
             };
 
             var tokenStore = context.RequestServices.GetRequiredService<ITokenStorer>();
-            await tokenStore.RecordAsync(token);
+            await tokenStore.RecordAsync(token, principal.FindFirstValue(ClaimTypes.NameIdentifier)!, 
+                expirationTime);
 
-            await context.Response.WriteAsJsonAsync(tokenDto);
+            await context.Response.WriteAsJsonAsync(ResponseObject.Create(tokenDto));
         }
         else
         {

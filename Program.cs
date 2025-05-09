@@ -189,6 +189,15 @@ app.MapPost("/login", static async ([FromBody] LoginRequest? loginRequest,
         return Results.BadRequest(ResponseObject.Create("Invalid login credential"));
     }
 
+    var tokenStorer = context.RequestServices.GetRequiredService<ITokenStorer>();
+    var existing = await tokenStorer.GetTokenAsync(user.Id);
+    if (existing.IsSucceed
+        && existing.Token is IToken token
+        && !token.IsExpired)
+    {
+        return Results.Ok(ResponseObject.Create(existing.Token.ToAccessTokenDto()));
+    }
+
     await signInManager.SignInWithClaimsAsync(user, false, []);
 
     // token response is already written by authentication service. Return Empty.
@@ -418,7 +427,7 @@ public class BearerTokenManager : ITokenStorer, ITokenValidator
 {
     private readonly List<BearerToken> bearerTokens = new();
 
-    public Task<TokenOperationResult> RecordAsync(string token)
+    public Task<TokenOperationResult> RecordAsync(string token, string userIdentifier, DateTime expiredAt)
     {
         if (bearerTokens.Find(t => t.Token == token) is not null)
         {
@@ -427,7 +436,9 @@ public class BearerTokenManager : ITokenStorer, ITokenValidator
 
         bearerTokens.Add(new BearerToken()
         {
-            Token = token
+            Token = token,
+            UserIdentifier = userIdentifier,
+            ExpiredAt = expiredAt
         });
 
         return Task.FromResult(TokenOperationResult.Succeed());
@@ -444,21 +455,40 @@ public class BearerTokenManager : ITokenStorer, ITokenValidator
         return Task.FromResult(TokenOperationResult.Failed("Token not found"));
     }
 
+    public Task<TokenFetchResult> GetTokenAsync(string userIdentifier)
+    {
+        if (bearerTokens.Find(t => t.UserIdentifier == userIdentifier
+            && t.ExpiredAt > DateTime.UtcNow
+            && !t.IsExpired) is BearerToken bearerToken)
+        {
+            return Task.FromResult(TokenFetchResult.Succeed(bearerToken));
+        }
+
+        return Task.FromResult(new TokenFetchResult(false, null, "Token not found"));
+    }
+
     public Task<TokenValidityResult> ValidateAsync(string token)
     {
         if (bearerTokens.FirstOrDefault(t => t.Token == token) is BearerToken bearerToken)
         {
+            if (DateTime.UtcNow >= bearerToken.ExpiredAt)
+            {
+                bearerToken.IsExpired = true;
+            }
+            
             return Task.FromResult(
-                TokenValidityResult.SucceedWithStatus(
-                    bearerToken.IsExpired ? ValidityStatus.Expired : ValidityStatus.Valid));
+                    TokenValidityResult.SucceedWithStatus(
+                        bearerToken.IsExpired ? ValidityStatus.Expired : ValidityStatus.Valid));
         }
 
         return Task.FromResult(TokenValidityResult.SucceedWithStatus(ValidityStatus.NotValid));
     }
 
-    public class BearerToken
+    public class BearerToken : IToken
     {
-        public required string Token { get; set; }
+        public required string Token { get; init; }
+        public required string UserIdentifier { get; init; }
+        public DateTime ExpiredAt { get; init; }
         public bool IsExpired { get; set; }
 
         public override string ToString()
