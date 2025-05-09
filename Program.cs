@@ -1,19 +1,21 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Identity;
 using UrlShortener.Data;
 using UrlShortener.Model;
-using Microsoft.AspNetCore.Authorization;
-using System.Text.Json.Nodes;
 using UrlShortener.BackgroundServices;
 using System.Security.Claims;
 using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication.BearerToken;
 using UrlShortener.Responses;
-using System.Text.Json;
 using Microsoft.AspNetCore.Identity.Data;
+using Microsoft.AspNetCore.Mvc;
+using System.ComponentModel.DataAnnotations;
+using Microsoft.AspNetCore.Authentication;
+using UrlShortener.Handlers;
+using Microsoft.AspNetCore.Authorization;
+using UrlShortener.Interfaces;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,16 +31,23 @@ builder.Services.AddAuthentication()
     .AddBearerToken(IdentityConstants.BearerScheme, options => options.BearerTokenExpiration = TimeSpan.FromSeconds(60));
 builder.Services.AddAuthorization();
 
+// make sure to add SignInManager
 builder.Services.AddIdentityCore<IdentityUser>()
     .AddEntityFrameworkStores<ApplicationDbContext>()
-    .AddApiEndpoints();
+    .AddSignInManager<SignInManager<IdentityUser>>();
+
+builder.Services.AddScoped<IAuthenticationService, CustomAuthenticationService>(
+    (provider) => new CustomAuthenticationService(ActivatorUtilities.CreateInstance<AuthenticationService>(provider))
+);
+
+var tokenManager = new BearerTokenManager();
+builder.Services.AddSingleton<ITokenStorer>(tokenManager);
+builder.Services.AddSingleton<ITokenValidator>(tokenManager);
 
 builder.Services.AddHostedService<ExpiredUrlRemoverHostedService>();
-
 UrlEntExtensions.Init("https://localhost:7000", "/s/");
 
 var app = builder.Build();
-app.MapIdentityApi<IdentityUser>();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -47,153 +56,153 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
 // put this middleware before the authentication and authorization middleware
 // for writing the response body with 401 response code
-// also for capturing the token generated after the authentication process
 app.Use(async (context, next) =>
 {
-    if (PathHelper.IsHiddenPath(context))
+    try
     {
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return;
-    }
-
-    var endpoint = context.GetEndpoint();
-
-    bool isLoginPath = context.Request.Path == "/login";
-    bool isRegisterPath = context.Request.Path == "/register";
-
-    if (isRegisterPath)
-    {
-        context.Request.EnableBuffering();
-    }
-
-    // cache the original body stream as it was a forward-only body and can only be read
-    // once the response is written
-    var originalBodyStream = context.Response.Body;
-    MemoryStream memoryStream = null!;
-    
-    // replace the original response body stream with a MemoryStream
-    if (isLoginPath)
-    {
-        memoryStream = new MemoryStream();
-        context.Response.Body = memoryStream;
-    }
-
-    // check if the token has been manually expired by hitting /logout endpoint
-    // then do not proceed the request pipeline
-    // and return 401 response code
-    if (endpoint != null
-        && endpoint.Metadata.Any(m => m.GetType() == typeof(AuthorizeAttribute)
-        && !isLoginPath))
-    {
-        var authorization = context.Request.Headers.Authorization.ToString();
-        if (authorization.Contains("Bearer"))
+        var endpoint = context.GetEndpoint();
+        // check if the token has been manually expired by hitting /logout endpoint
+        // then do not proceed the request pipeline
+        // and return 401 response code
+        if (endpoint != null
+            && endpoint.Metadata.Any(m => m.GetType() == typeof(AuthorizeAttribute)))
         {
-            var token = authorization.Replace("Bearer", "").Trim();
-            var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-            var validity = tokenManager.CheckValidity(token);
-            if (validity != BearerTokenManager.ValidityStatus.Valid)
+            var authorization = context.Request.Headers.Authorization.ToString();
+            if (authorization.StartsWith("Bearer"))
             {
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await context.Response.WriteAsJsonAsync(validity.ToResponseObject());
-                return;
-            }
-        }
-    }
+                var token = authorization.Replace("Bearer", "").Trim();
+                var tokenValidator = context.RequestServices.GetRequiredService<ITokenValidator>();
+                var validityResult = await tokenValidator.ValidateAsync(token);
 
-    // proceed with the rest of the pipeline
-    await next();
-
-    if (context.Response.StatusCode == StatusCodes.Status200OK)
-    {
-        // if the request is to login path
-        // we store the the generated token into our own token manager so that
-        // we can manually expire it instead of waiting for the expiration time
-        if (isLoginPath)
-        {
-            // move the stream position to the beginning
-            // and read the stream and return as json string
-            memoryStream!.Seek(0, SeekOrigin.Begin);
-            var streamReader = new StreamReader(memoryStream);
-            var responseBody = await streamReader.ReadToEndAsync();
-
-            try
-            {
-                var jsonNode = JsonNode.Parse(responseBody);
-                if (jsonNode != null
-                    && jsonNode["accessToken"] is JsonNode accToken)
+                if (!validityResult.IsSucceed
+                    || validityResult.ValidityStatus != ValidityStatus.Valid)
                 {
-                    // get the token value in the json body using
-                    // accessToken key from ASP.NET Core AccessTokenResponse object
-                    var accessToken = accToken.GetValue<string>();
-                    var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-
-                    // then store it into our token manager
-                    var success = tokenManager.Add(accessToken);
-                    var tokenOptions = context.RequestServices.GetRequiredService<IOptionsMonitor<BearerTokenOptions>>();
-                    var tokenProtector = tokenOptions.Get(IdentityConstants.BearerScheme).BearerTokenProtector;
-
-                    var tokenData = tokenProtector.Unprotect(accessToken);
-                    var expireDt = tokenData!.Properties.ExpiresUtc!.Value.LocalDateTime;
-
-                    var accessTokenDto = new AccessTokenDto()
-                    {
-                        AccessToken = accessToken,
-                        ExpiredAt = expireDt
-                    };
-
-                    memoryStream.SetLength(0);
-                    await memoryStream.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(accessTokenDto));
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsJsonAsync(validityResult.ValidityStatus.ToResponseObject());
+                    return;
                 }
             }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error while deserializing the access token: {ex}");
-            }
-
-            // move the stream position bac to the beginning
-            // and copy its value to the original response body stream
-            memoryStream.Seek(0, SeekOrigin.Begin);
-            await memoryStream.CopyToAsync(originalBodyStream);
-            streamReader.Dispose();
-
-            // then reassign the original response body stream;
-            context.Response.Body = originalBodyStream;
         }
-        else if (isRegisterPath)
-        {
-            try
-            {
-                context.Request.Body.Position = 0;
-                var requestBody = await context.Request.ReadFromJsonAsync<RegisterRequest>();
 
-                if (requestBody != null)
-                {
-                    await context.Response.WriteAsJsonAsync(ResponseObject.Create($"User {requestBody.Email} has been created succesfully"));
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error while parsing register request body: {ex}");
-            }
+        await next(context);
+
+        // if the response code is 401 and the body is empty
+        // we write a custom body
+        if (context.Response.StatusCode == StatusCodes.Status401Unauthorized
+                && !context.Response.HasStarted)
+        {
+            await context.Response.WriteAsJsonAsync(ResponseObject.TokenNotValid());
         }
     }
-
-    // don't forget to release the resource
-    memoryStream?.Dispose();
-
-    // if the response code is 401 and the body is empty
-    // we write a custom body
-    if (context.Response.StatusCode == StatusCodes.Status401Unauthorized
-            && !context.Response.HasStarted)
+    catch (Exception ex)
     {
-        await context.Response.WriteAsJsonAsync(ResponseObject.TokenNotValid());
+        var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+
+        if (ex is BadHttpRequestException badHttpRequestException)
+        {
+            logger.LogError("There was an error parsing request data {reqId}: {ex}", context.TraceIdentifier, ex);
+
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsJsonAsync(ResponseObject.Create("Please provide a valid request data"));
+        }
+        else
+        {
+            logger.LogError("There was an processing request {reqId}: {ex}", context.TraceIdentifier, ex);
+
+            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            await context.Response.WriteAsJsonAsync(ResponseObject.Create("There was an error processing your request on our server"));
+        }
     }
 });
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapPost("/register", static async ([FromBody] RegisterRequest? registerRequest,
+    [FromServices] IServiceProvider sp) =>
+{
+    if (registerRequest == null)
+    {
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid request body"));
+    }
+
+    var userManager = sp.GetRequiredService<UserManager<IdentityUser>>();
+
+    if (!userManager.SupportsUserEmail)
+    {
+        throw new NotSupportedException($"/register endpoint needs user manager that supports email!");
+    }
+
+    var email = registerRequest.Email;
+    if (string.IsNullOrEmpty(email)
+        || !IdentityHelper.IsEmailValid(email))
+    {
+        return Results.BadRequest(ResponseObject.Create($"Please provide a valid email address"));
+    }
+
+    var user = new IdentityUser();
+    await userManager.SetUserNameAsync(user, email);
+    await userManager.SetEmailAsync(user, email);
+
+    var userResult = await userManager.CreateAsync(user, registerRequest.Password);
+
+    if (!userResult.Succeeded)
+    {
+        var errorPairs = userResult.Errors.Aggregate(new Dictionary<string, string[]>(),
+            (acc, next) =>
+        {
+            if (!acc.ContainsKey(next.Code))
+            {
+                acc[next.Code] = [next.Description];
+            }
+
+            return acc;
+        });
+
+        var problemDetails = new HttpValidationProblemDetails(errorPairs);
+
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid password", problemDetails));
+    }
+
+    return Results.Ok(ResponseObject.Create($"User {registerRequest.Email} has been registered succesfully"));
+});
+
+app.MapPost("/login", static async ([FromBody] LoginRequest? loginRequest,
+    HttpContext context) =>
+{
+    if (loginRequest == null)
+    {
+        return Results.BadRequest(ResponseObject.Create("Please provide a valid request body"));
+    }
+
+    var signInManager = context.RequestServices.GetRequiredService<SignInManager<IdentityUser>>();
+
+    signInManager.AuthenticationScheme = IdentityConstants.BearerScheme;
+
+    var user = await signInManager.UserManager.FindByNameAsync(loginRequest.Email);
+    if (user == null
+        || !(await signInManager.CheckPasswordSignInAsync(user, loginRequest.Password, IdentityHelper.LockOutOnFailed)).Succeeded)
+    {
+        return Results.BadRequest(ResponseObject.Create("Invalid login credential"));
+    }
+
+    var tokenStorer = context.RequestServices.GetRequiredService<ITokenStorer>();
+    var existing = await tokenStorer.GetTokenAsync(user.Id);
+    if (existing.IsSucceed
+        && existing.Token is IToken token
+        && !token.IsExpired)
+    {
+        return Results.Ok(ResponseObject.Create(existing.Token.ToAccessTokenDto()));
+    }
+
+    await signInManager.SignInWithClaimsAsync(user, false, []);
+
+    // token response is already written by authentication service. Return Empty.
+    return Results.Empty;
+});
 
 app.MapGet("/all", static async (ApplicationDbContext dbContext, HttpContext httpContext) =>
 {
@@ -287,12 +296,13 @@ app.MapGet("/id/{id:int}", static async (int? id, ApplicationDbContext dbContext
         else
         {
             var token = authorizationHeader.Replace("Bearer", "").Trim();
-            var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
+            var tokenValidator = context.RequestServices.GetRequiredService<ITokenValidator>();
+            var validityResult = await tokenValidator.ValidateAsync(token);
 
-            var validity = tokenManager.CheckValidity(token);
-            if (validity != BearerTokenManager.ValidityStatus.Valid)
+            if (!validityResult.IsSucceed
+                || validityResult.ValidityStatus != ValidityStatus.Valid)
             {
-                return Results.Json(validity.ToResponseObject(),
+                return Results.Json(validityResult.ValidityStatus.ToResponseObject(),
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
@@ -359,10 +369,8 @@ app.MapPost("/logout", static async (HttpContext context) =>
     var authorization = context.Request.Headers.Authorization.ToString();
     var token = authorization.Replace("Bearer", "").Trim();
 
-    var tokenManager = context.RequestServices.GetRequiredService<BearerTokenManager>();
-    tokenManager.Expire(token);
-
-    await Task.CompletedTask;
+    var tokenStore = context.RequestServices.GetRequiredService<ITokenStorer>();
+    await tokenStore.ExpireAsync(token);
 
     return Results.Ok(ResponseObject.Create("Logged out succesfully. Token has been expired"));
 })
@@ -403,49 +411,84 @@ public static partial class UrlShortenerUtils
     }
 }
 
-public class BearerTokenManager
+public static class IdentityHelper
+{
+    private static EmailAddressAttribute emailAddressAttribute = new();
+
+    public const bool LockOutOnFailed = false;
+
+    public static bool IsEmailValid(string email)
+    {
+        return emailAddressAttribute.IsValid(email);
+    }
+}
+
+public class BearerTokenManager : ITokenStorer, ITokenValidator
 {
     private readonly List<BearerToken> bearerTokens = new();
 
-    public bool Add(string token)
+    public Task<TokenOperationResult> RecordAsync(string token, string userIdentifier, DateTime expiredAt)
     {
         if (bearerTokens.Find(t => t.Token == token) is not null)
         {
-            return false;
+            return Task.FromResult(TokenOperationResult.Failed("Token has already been stored"));
         }
 
         bearerTokens.Add(new BearerToken()
         {
-            Token = token
+            Token = token,
+            UserIdentifier = userIdentifier,
+            ExpiredAt = expiredAt
         });
 
-        return true;
+        return Task.FromResult(TokenOperationResult.Succeed());
     }
 
-    public bool Expire(string token)
+    public Task<TokenOperationResult> ExpireAsync(string token)
     {
         if (bearerTokens.Find(t => t.Token == token) is BearerToken bearerToken)
         {
             bearerToken.IsExpired = true;
-            return true;
+            return Task.FromResult(TokenOperationResult.Succeed());
         }
 
-        return false;
+        return Task.FromResult(TokenOperationResult.Failed("Token not found"));
     }
 
-    public ValidityStatus CheckValidity(string token)
+    public Task<TokenFetchResult> GetTokenAsync(string userIdentifier)
+    {
+        if (bearerTokens.Find(t => t.UserIdentifier == userIdentifier
+            && t.ExpiredAt > DateTime.UtcNow
+            && !t.IsExpired) is BearerToken bearerToken)
+        {
+            return Task.FromResult(TokenFetchResult.Succeed(bearerToken));
+        }
+
+        return Task.FromResult(new TokenFetchResult(false, null, "Token not found"));
+    }
+
+    public Task<TokenValidityResult> ValidateAsync(string token)
     {
         if (bearerTokens.FirstOrDefault(t => t.Token == token) is BearerToken bearerToken)
         {
-            return bearerToken.IsExpired ? ValidityStatus.Expired : ValidityStatus.Valid;
+            if (DateTime.UtcNow >= bearerToken.ExpiredAt)
+            {
+                bearerToken.IsExpired = true;
+            }
+            
+            return Task.FromResult(
+                    TokenValidityResult.SucceedWithStatus(
+                        bearerToken.IsExpired ? ValidityStatus.Expired : ValidityStatus.Valid));
         }
 
-        return ValidityStatus.NotValid;
+        return Task.FromResult(TokenValidityResult.SucceedWithStatus(ValidityStatus.NotValid));
     }
 
-    public class BearerToken
+    public class BearerToken : IToken
     {
-        public required string Token { get; set; }
+        public required string Token { get; init; }
+        public required string UserIdentifier { get; init; }
+        public DateTime ExpiredAt { get; init; }
         public bool IsExpired { get; set; }
 
         public override string ToString()
@@ -453,55 +496,23 @@ public class BearerTokenManager
             return Token;
         }
     }
-
-    public enum ValidityStatus
-    {
-        NotValid,
-        Valid,
-        Expired
-    }
 }
 
 public static class ValidityStatusExtensions
 {
-    public static ResponseObject ToResponseObject(this BearerTokenManager.ValidityStatus validity, object? result = null)
+    public static ResponseObject ToResponseObject(this ValidityStatus validity, object? result = null)
     {
         string message = "";
 
         switch (validity)
         {
-            case BearerTokenManager.ValidityStatus.Expired:
+            case ValidityStatus.Expired:
                 return ResponseObject.TokenExpired(result);
-            case BearerTokenManager.ValidityStatus.NotValid:
+            case ValidityStatus.NotValid:
                 message = "Your token is not valid";
                 break;
         }
 
         return ResponseObject.Create(message, result);
-    }
-}
-
-public static class PathHelper
-{
-    private static readonly string[] HiddenPaths =
-    {
-        "/refresh",
-        "/confirmEmail",
-        "/resendConfirmationEmail",
-        "/forgotPassword",
-        "/resetPassword",
-        "/manage/2fa",
-        "/manage/info"
-    };
-
-    public static bool IsHiddenPath(HttpContext httpContext)
-    {
-        var path = httpContext.Request.Path.Value;
-        if (HiddenPaths.Contains(path))
-        {
-            return true;
-        }
-
-        return false;
     }
 }
